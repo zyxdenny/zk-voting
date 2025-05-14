@@ -7,3 +7,4 @@ voter.json
 proof.json
 ticket.json
 result.json
+contracts/Verifier.sol
