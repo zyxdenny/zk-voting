@@ -28,12 +28,15 @@ npm i
 ### Usage
 
 ```bash
-npm run start-poll     # Initialize a new poll
-npm run get-ticket     # Get your voting ticket
-npm run vote           # Cast your vote
-npm run verify         # Verify a proof manually
-npm run clean          # Clean build files
+1. npm run clean          # Clean build files if needed
+2. npm i
+3. npm run start-poll     # Initialize a new poll
+4. npm run get-ticket     # Get your voting ticket
+5. npm run vote           # Cast your vote
+6. npm run verify         # Verify a proof manually
 ```
+You need to choose address and input manually into the account address to get ticket
+If you want to simulate multiple voting processes, you can repeat steps 2-6 and enter different addresses.
 
 ## Project Structure
 
