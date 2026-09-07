@@ -1,62 +1,77 @@
 const circomlibjs = require("circomlibjs");
-const appRoot = require('app-root-path');
-const fs = require('fs');
+const appRoot = require("app-root-path");
 const { voters } = require(`${appRoot}/votersList.json`);
 
-/**
- * Creates a Merkle tree from the given voters list
- * @returns {Object} The Merkle tree object
- */
-async function buildMerkleTree() {
-    const poseidon = await circomlibjs.buildPoseidonOpt();
+// Must match `Vote(10)` in circuits/circuit.circom.
+const DEPTH = 10;
+const WIDTH = 2 ** DEPTH;
 
-    // Hash functions
-    const leafHash = (input) => poseidon([input]);
-    const nodeHash = (left, right) => poseidon([left, right]);
-
-    // Create inputs array
-    let inputs = new Array(2**10);
-    for (let i = 0; i < inputs.length; i++) {
-        if(i < voters.length) {
-            inputs[i] = voters[i];
-        } else {
-            inputs[i] = voters[voters.length - 1];
-        }
-    }
-
-    // Build the tree
-    const tree = await merkleTree(inputs, leafHash, nodeHash);
-    console.log("-------------- Merkle Tree ------------------");
-    console.log("Root: ", poseidon.F.toString(tree.root));
-
-    return { tree, poseidon };
+let poseidonPromise;
+function getPoseidon() {
+    if (!poseidonPromise) poseidonPromise = circomlibjs.buildPoseidonOpt();
+    return poseidonPromise;
 }
 
 /**
- * Builds a Merkle tree and returns key information
- * @returns {Object} Contains tree, root, and poseidon
+ * Position of an address in votersList.json, or -1 if it is not registered.
+ * Case-insensitive: the leaf is Poseidon(address-as-field-element), which
+ * does not depend on the hex casing.
  */
-async function initiatePoll() {
-    const { tree, poseidon } = await buildMerkleTree();
+function voterIndex(addr) {
+    if (typeof addr !== "string") return -1;
+    const needle = addr.trim().toLowerCase();
+    return voters.findIndex((v) => v.toLowerCase() === needle);
+}
+
+/**
+ * Builds the Poseidon Merkle tree of registered voters.
+ * @returns {{tree: Object, root: String, poseidon: Object}} root is a decimal string
+ */
+async function buildMerkleTree() {
+    if (voters.length === 0) throw new Error("votersList.json has no voters");
+    if (voters.length > WIDTH) {
+        throw new Error(`votersList.json has ${voters.length} voters; the circuit supports at most ${WIDTH}`);
+    }
+
+    const poseidon = await getPoseidon();
+    const leafHash = (input) => poseidon([input]);
+    const nodeHash = (left, right) => poseidon([left, right]);
+
+    // Pad the tree by repeating the last voter. In this scheme every leaf in
+    // the tree is votable, so padding with any *other* value (0, a random
+    // number) would create extra ballots. Duplicates of a real voter share
+    // that voter's nullifier and therefore add nothing.
+    const inputs = new Array(WIDTH);
+    for (let i = 0; i < WIDTH; i++) {
+        inputs[i] = i < voters.length ? voters[i] : voters[voters.length - 1];
+    }
+
+    const tree = await merkleTree(inputs, leafHash, nodeHash);
     const root = poseidon.F.toString(tree.root);
     return { tree, root, poseidon };
 }
 
+/** @deprecated kept for older callers; identical to buildMerkleTree */
+async function initiatePoll() {
+    return buildMerkleTree();
+}
+
 /**
- * Generate a nullifier for a voter
- * @param {String} root The Merkle root
- * @param {String} addr The voter address
- * @returns {String} The nullifier
+ * Nullifier for one voter in one poll: Poseidon(root, Poseidon(addr)).
+ * Matches `poseidon(root, lemma[0]) === nullifier` in the circuit.
+ * @param {String} root Merkle root (decimal string)
+ * @param {String} addr Voter address
+ * @returns {String} decimal string
  */
 async function generateNullifier(root, addr) {
-    const poseidon = await circomlibjs.buildPoseidonOpt();
-    const addrHash = poseidon([addr]);
-    return poseidon.F.toString(poseidon([root, addrHash]));
+    const poseidon = await getPoseidon();
+    const leaf = poseidon([addr]);
+    return poseidon.F.toString(poseidon([root, leaf]));
 }
 
 /**
  * Creates a Merkle tree object from the given input
- * @param {Array<any>} input Leafs of the merkle Tree
+ * @param {Array<any>} input Leafs of the merkle Tree (length must be a power of two)
  * @param {Function} leafHash Takes one input (leaf) and hashes it
  * @param {Function} nodeHash Takes two inputs (left and right node) and hashes it
  * @returns {Object} A Merkle tree with functionalities
@@ -73,6 +88,8 @@ async function merkleTree(input, leafHash, nodeHash) {
     merkle.inputs = [...input]; // Deep copy of array
     merkle.depth = Math.log2(merkle.inputs.length);
     merkle.nodes = [];
+
+    if (!Number.isInteger(merkle.depth)) throw new Error("Merkle tree width must be a power of two");
 
     // Calculate all nodes of the Merkle tree
     merkle.calculateNodes = function() {
@@ -101,7 +118,7 @@ async function merkleTree(input, leafHash, nodeHash) {
 
     // Creates a Merkle proof from tree
     merkle.getMerkleProof = function(index) {
-        if (merkle.inputs.length <= index) throw "Invalid index";
+        if (merkle.inputs.length <= index) throw new Error("Invalid index");
 
         // Generate path
         let path = new Uint8Array(merkle.depth).fill(0);
@@ -154,6 +171,11 @@ async function merkleTree(input, leafHash, nodeHash) {
 }
 
 module.exports = {
+    DEPTH,
+    voters,
+    voterIndex,
+    getPoseidon,
+    buildMerkleTree,
     initiatePoll,
     generateNullifier,
     merkleTree

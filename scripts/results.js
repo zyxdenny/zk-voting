@@ -1,7 +1,8 @@
-// `npm run init-voters`: last step of `npm run start-poll`.
-const { startPoll } = require("./cli");
+// Hardhat script: `npm run results`.
+const hre = require("hardhat");
+const { showResults } = require("./cli");
 
-startPoll()
+showResults(hre)
     .then(() => process.exit(0))
     .catch((error) => {
         console.error(error.message || error);

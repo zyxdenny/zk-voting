@@ -1,79 +1,87 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+/// @dev Matches the verifier snarkjs generates for circuits/circuit.circom
+///      (`snarkjs zkey export solidityverifier`), which has three public
+///      signals: [merkleRoot, nullifier, vote].
 interface IVerifier {
     function verifyProof(
-        uint256[2] memory a,
-        uint256[2][2] memory b,
-        uint256[2] memory c,
-        uint256[3] memory input
+        uint256[2] calldata a,
+        uint256[2][2] calldata b,
+        uint256[2] calldata c,
+        uint256[3] calldata input
     ) external view returns (bool);
 }
 
+/// @title Anonymous yes/no poll gated by a zk-SNARK membership proof.
+/// @notice One contract is one poll. The registered voter set is fixed at
+///         deployment as a Merkle root; a ballot is accepted when it carries a
+///         valid proof for that root and an unused nullifier. The contract
+///         never looks at msg.sender, so ballots can be relayed.
 contract DAOVoting {
-    // The verifier contract that validates zk proofs
-    IVerifier public verifier;
-    
-    // Store used nullifiers to prevent double voting
+    IVerifier public immutable verifier;
+
+    /// @notice Poseidon Merkle root of the eligible voters. Proofs for any
+    ///         other root are rejected, so an attacker cannot vote with a tree
+    ///         of their own making.
+    uint256 public immutable merkleRoot;
+
+    /// @notice Nullifiers already spent. Poseidon(root, leaf) is deterministic
+    ///         per voter, which is what makes a second ballot detectable.
     mapping(uint256 => bool) public nullifiers;
-    
-    // Track vote counts (for demonstration purposes)
+
     uint256 public yesVotes;
     uint256 public noVotes;
-    
-    // Event emitted when a vote is cast
+
     event VoteSubmitted(uint256 nullifier, uint256 voteValue, uint256 merkleRoot);
-    
-    constructor(address _verifierAddress) {
-        verifier = IVerifier(_verifierAddress);
+
+    constructor(address _verifier, uint256 _merkleRoot) {
+        require(_verifier != address(0), "Verifier required");
+        require(_merkleRoot != 0, "Merkle root required");
+        verifier = IVerifier(_verifier);
+        merkleRoot = _merkleRoot;
     }
-    
+
     /**
-     * @dev Submit a vote with a zero-knowledge proof
-     * @param _a Part of the zk-SNARK proof
-     * @param _b Part of the zk-SNARK proof
-     * @param _c Part of the zk-SNARK proof
-     * @param _input Public inputs to the proof:
-     *        _input[0]: Merkle root of eligible voters
-     *        _input[1]: Nullifier hash to prevent double voting
-     *        _input[2]: Vote value (0 for No, 1 for Yes)
+     * @notice Submit one anonymous ballot.
+     * @param a      Groth16 proof, part A
+     * @param b      Groth16 proof, part B
+     * @param c      Groth16 proof, part C
+     * @param input  Public signals, in circuit order:
+     *               input[0] Merkle root the proof was made against
+     *               input[1] nullifier
+     *               input[2] vote: 0 = no, 1 = yes
      */
     function submitVote(
-        uint256[2] memory _a,
-        uint256[2][2] memory _b,
-        uint256[2] memory _c,
-        uint256[3] memory _input
+        uint256[2] calldata a,
+        uint256[2][2] calldata b,
+        uint256[2] calldata c,
+        uint256[3] calldata input
     ) external {
-        // Extract public inputs
-        uint256 merkleRoot = _input[0];
-        uint256 nullifier = _input[1];
-        uint256 voteValue = _input[2];
-        
-        // Check that the nullifier hasn't been used before
+        uint256 root = input[0];
+        uint256 nullifier = input[1];
+        uint256 voteValue = input[2];
+
+        // Cheap checks first, proof verification (~200k gas) last.
+        require(root == merkleRoot, "Unknown voter set");
         require(!nullifiers[nullifier], "Vote already cast");
-        
-        // Verify the zero-knowledge proof
-        require(verifier.verifyProof(_a, _b, _c, _input), "Invalid proof");
-        
-        // Check vote value is valid (0 or 1)
         require(voteValue == 0 || voteValue == 1, "Invalid vote value");
-        
-        // Mark the nullifier as used
+        require(verifier.verifyProof(a, b, c, input), "Invalid proof");
+
         nullifiers[nullifier] = true;
-        
-        // Count the vote
+
         if (voteValue == 1) {
             yesVotes++;
         } else {
             noVotes++;
         }
-        
-        // Emit event with vote information
-        emit VoteSubmitted(nullifier, voteValue, merkleRoot);
+
+        emit VoteSubmitted(nullifier, voteValue, root);
     }
-    
-    // Get current voting results
-    function getResults() external view returns (uint256, uint256) {
+
+    /// @return yes number of yes ballots
+    /// @return no  number of no ballots
+    function getResults() external view returns (uint256 yes, uint256 no) {
         return (yesVotes, noVotes);
     }
 }
