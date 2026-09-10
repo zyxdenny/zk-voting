@@ -1,90 +1,128 @@
 const { groth16 } = require("snarkjs");
-const appRoot = require('app-root-path');
-const fs = require('fs');
-const { initiatePoll, generateNullifier } = require('./merkleUtils');
+const appRoot = require("app-root-path");
+const fs = require("fs");
+const path = require("path");
+const {
+    toDecimal,
+    computeCommitment,
+    computeNullifier,
+    buildMerkleTree,
+    merkleProofOf,
+} = require("./merkleUtils");
 
-/**
- * Generates a proof for a voter
- * @param {String} addr The voter address
- * @returns {Object} The proof and public signals
- */
-async function generateProof(addr) {
-    // Load voter data
-    const voter = require(`${appRoot}/voter.json`);
-    
-    if(voter[addr] == undefined) {
-        console.log("Invalid Voter");
-        process.exit(1);
+const BUILD_DIR = path.join(appRoot.path, "circuits", "build");
+const WASM_PATH = path.join(BUILD_DIR, "circuit_js", "circuit.wasm");
+const ZKEY_PATH = path.join(BUILD_DIR, "keys", "circuit_0000.zkey");
+const VKEY_PATH = path.join(BUILD_DIR, "keys", "verification_key.json");
+const VERIFIER_SOL_PATH = path.join(appRoot.path, "contracts", "Verifier.sol");
+
+/** True once `npm run build-circuit` has produced the wasm, zkey and vkey. */
+function circuitIsBuilt() {
+    return [WASM_PATH, ZKEY_PATH, VKEY_PATH].every((p) => fs.existsSync(p));
+}
+
+function ensureBuilt() {
+    if (!circuitIsBuilt()) {
+        throw new Error("Circuit artifacts missing. Run `npm run build-circuit` first.");
     }
-    
-    // Initialize poll and get Merkle tree
-    const { tree, root, poseidon } = await initiatePoll();
-    
-    // Generate nullifier
-    const vid = await generateNullifier(root, addr);
-
-    // Get Merkle proof
-    let merkleproof = tree.getMerkleProof(voter[addr]);
-    console.log("-------------- Merkle Proof ------------------");
-    merkleproof.lemma = merkleproof.lemma.map((x) => poseidon.F.toString(x));
-    console.log(merkleproof.lemma);
-    
-    // Generate zkSNARK proof
-    const { proof, publicSignals } = await groth16.fullProve(
-        {
-            votingID: root,
-            lemma: merkleproof.lemma, 
-            path: merkleproof.circompath,
-            nullifier: vid
-        },
-        `${appRoot}/circuits/build/circuit_js/circuit.wasm`,
-        `${appRoot}/circuits/build/keys/circuit_0000.zkey`
-    );
-    
-    console.log("-------------- Public Signals (pp) ------------------");
-    console.log(publicSignals);
-    console.log("---------------- Proof (pi) ----------------");
-    console.log(proof);
-
-    return { proof, publicSignals };
 }
 
 /**
- * Verifies a zkSNARK proof
- * @param {Object} proof The proof
- * @param {Array} publicSignals The public signals
- * @returns {Boolean} True if valid, false otherwise
+ * Normalises user input into the circuit's vote signal.
+ * @param {String|Number} value yes/no, y/n, 1/0, true/false
+ * @returns {Number} 1 for yes, 0 for no
+ */
+function parseVote(value) {
+    const v = String(value).trim().toLowerCase();
+    if (["1", "yes", "y", "true"].includes(v)) return 1;
+    if (["0", "no", "n", "false"].includes(v)) return 0;
+    throw new Error(`Invalid vote "${value}". Use yes or no.`);
+}
+
+/**
+ * Assembles every circuit input for one ballot.
+ * @param {Object} ballot
+ * @param {{secret: String}} ballot.identity   the voter's identity
+ * @param {Array<String>} ballot.commitments   the registry the poll was deployed with
+ * @param {String|BigInt} ballot.pollId        the poll's id, read from the contract
+ * @param {Number} ballot.vote                 0 or 1
+ * @returns {Object} {root, pollId, nullifier, vote, secret, siblings, path}, field elements as decimal strings
+ */
+async function buildBallotInputs({ identity, commitments, pollId, vote }) {
+    const secret = toDecimal(identity.secret);
+    const commitment = await computeCommitment(secret);
+    const index = commitments.map(toDecimal).indexOf(commitment);
+    if (index < 0) {
+        throw new Error("This identity is not registered: its commitment is not in the registry");
+    }
+
+    const { tree, root, poseidon } = await buildMerkleTree(commitments);
+    const { siblings, path: pathBits } = merkleProofOf(tree, poseidon, index);
+
+    return {
+        root,
+        pollId: toDecimal(pollId),
+        nullifier: await computeNullifier(pollId, secret),
+        vote: String(vote),
+        secret,
+        siblings,
+        path: pathBits,
+    };
+}
+
+/**
+ * Runs the prover on already-assembled inputs. Throws if the inputs violate a
+ * circuit constraint (the witness calculator reports "Assert Failed").
+ * @returns {{proof: Object, publicSignals: Array<String>}}
+ */
+async function proveInputs(inputs) {
+    ensureBuilt();
+    return groth16.fullProve(inputs, WASM_PATH, ZKEY_PATH);
+}
+
+/**
+ * Generates a ballot proof.
+ * @param {Object} ballot see buildBallotInputs
+ * @param {Object} [overrides] Replace individual circuit inputs (used by tests
+ *                             to show that tampered inputs are rejected)
+ * @returns {{proof: Object, publicSignals: Array<String>, inputs: Object}}
+ *          publicSignals are [root, pollId, nullifier, vote]
+ */
+async function generateProof(ballot, overrides = {}) {
+    ensureBuilt();
+    const inputs = { ...(await buildBallotInputs(ballot)), ...overrides };
+    const { proof, publicSignals } = await proveInputs(inputs);
+    return { proof, publicSignals, inputs };
+}
+
+/**
+ * Verifies a proof off-chain against the exported verification key.
+ * @returns {Boolean}
  */
 async function verifyProof(proof, publicSignals) {
-    const vKey = JSON.parse(fs.readFileSync(`${appRoot}/circuits/build/keys/verification_key.json`));
-    const res = await groth16.verify(vKey, publicSignals, proof);
-
-    if (res === true) {
-        console.log("Verification OK");
-        return true;
-    } else {
-        console.log("Invalid proof");
-        return false;
-    }
+    ensureBuilt();
+    const vKey = JSON.parse(fs.readFileSync(VKEY_PATH, "utf8"));
+    return groth16.verify(vKey, publicSignals, proof);
 }
 
 /**
- * Saves data to a JSON file
- * @param {Object} data The data to save
- * @param {String} filename The filename
+ * Converts a proof into the four arguments DAOVoting.submitVote takes.
+ * @returns {{a: Array, b: Array, c: Array, input: Array}} hex strings
  */
-async function saveToFile(data, filename) {
-    try {
-        const jsonData = JSON.stringify(data, null, 2);
-        fs.writeFileSync(`${appRoot}/${filename}.json`, jsonData, 'utf8');
-        console.log(`\n${filename} Successfully Downloaded\n`);
-    } catch (error) {
-        console.log(error);
-    }
+async function toSolidityCalldata(proof, publicSignals) {
+    const calldata = await groth16.exportSolidityCallData(proof, publicSignals);
+    const [a, b, c, input] = JSON.parse(`[${calldata}]`);
+    return { a, b, c, input };
 }
 
 module.exports = {
+    BUILD_DIR,
+    VERIFIER_SOL_PATH,
+    circuitIsBuilt,
+    parseVote,
+    buildBallotInputs,
+    proveInputs,
     generateProof,
     verifyProof,
-    saveToFile
+    toSolidityCalldata,
 };

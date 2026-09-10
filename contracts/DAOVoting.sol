@@ -1,79 +1,105 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+/// @dev Matches the verifier snarkjs generates for circuits/circuit.circom
+///      (`snarkjs zkey export solidityverifier`), which has four public
+///      signals: [merkleRoot, pollId, nullifier, vote].
 interface IVerifier {
     function verifyProof(
-        uint256[2] memory a,
-        uint256[2][2] memory b,
-        uint256[2] memory c,
-        uint256[3] memory input
+        uint256[2] calldata a,
+        uint256[2][2] calldata b,
+        uint256[2] calldata c,
+        uint256[4] calldata input
     ) external view returns (bool);
 }
 
+/// @title Anonymous yes/no poll gated by a zk-SNARK membership proof.
+/// @notice One contract is one poll. The registered voter set is fixed at
+///         deployment as a Merkle root of identity commitments. A ballot is
+///         accepted when it carries a valid proof for that root and this
+///         poll's id, with a nullifier that has not been seen before. The
+///         contract never looks at msg.sender, so ballots can be relayed.
 contract DAOVoting {
-    // The verifier contract that validates zk proofs
-    IVerifier public verifier;
-    
-    // Store used nullifiers to prevent double voting
+    /// @dev Order of the BN254 scalar field. Every public signal of the
+    ///      circuit lives in this field, so anything the contract compares a
+    ///      public signal against must be reduced into it.
+    uint256 public constant SNARK_SCALAR_FIELD =
+        21888242871839275222246405745257275088548364400416034343698204186575808495617;
+
+    IVerifier public immutable verifier;
+
+    /// @notice Poseidon Merkle root of the registered identity commitments.
+    ///         Proofs for any other root are rejected, so an attacker cannot
+    ///         vote with a tree of their own making.
+    uint256 public immutable merkleRoot;
+
+    /// @notice External nullifier of this poll: keccak256(chainid, this)
+    ///         reduced into the scalar field. Voters derive their nullifier
+    ///         from it, so the same identity yields unrelated nullifiers in
+    ///         different polls and a ballot cannot be replayed on another
+    ///         deployment or another chain.
+    uint256 public immutable pollId;
+
+    /// @notice Nullifiers already spent. Poseidon(pollId, secret) is
+    ///         deterministic per identity, which is what makes a second
+    ///         ballot detectable without learning which leaf it came from.
     mapping(uint256 => bool) public nullifiers;
-    
-    // Track vote counts (for demonstration purposes)
+
     uint256 public yesVotes;
     uint256 public noVotes;
-    
-    // Event emitted when a vote is cast
-    event VoteSubmitted(uint256 nullifier, uint256 voteValue, uint256 merkleRoot);
-    
-    constructor(address _verifierAddress) {
-        verifier = IVerifier(_verifierAddress);
+
+    event VoteSubmitted(uint256 indexed nullifier, uint256 voteValue);
+
+    constructor(address _verifier, uint256 _merkleRoot) {
+        require(_verifier != address(0), "Verifier required");
+        require(_merkleRoot != 0, "Merkle root required");
+        require(_merkleRoot < SNARK_SCALAR_FIELD, "Merkle root not in field");
+        verifier = IVerifier(_verifier);
+        merkleRoot = _merkleRoot;
+        pollId = uint256(keccak256(abi.encode(block.chainid, address(this)))) % SNARK_SCALAR_FIELD;
     }
-    
+
     /**
-     * @dev Submit a vote with a zero-knowledge proof
-     * @param _a Part of the zk-SNARK proof
-     * @param _b Part of the zk-SNARK proof
-     * @param _c Part of the zk-SNARK proof
-     * @param _input Public inputs to the proof:
-     *        _input[0]: Merkle root of eligible voters
-     *        _input[1]: Nullifier hash to prevent double voting
-     *        _input[2]: Vote value (0 for No, 1 for Yes)
+     * @notice Submit one anonymous ballot.
+     * @param a      Groth16 proof, part A
+     * @param b      Groth16 proof, part B
+     * @param c      Groth16 proof, part C
+     * @param input  Public signals, in circuit order:
+     *               input[0] Merkle root the proof was made against
+     *               input[1] poll id the nullifier was derived from
+     *               input[2] nullifier
+     *               input[3] vote: 0 = no, 1 = yes
      */
     function submitVote(
-        uint256[2] memory _a,
-        uint256[2][2] memory _b,
-        uint256[2] memory _c,
-        uint256[3] memory _input
+        uint256[2] calldata a,
+        uint256[2][2] calldata b,
+        uint256[2] calldata c,
+        uint256[4] calldata input
     ) external {
-        // Extract public inputs
-        uint256 merkleRoot = _input[0];
-        uint256 nullifier = _input[1];
-        uint256 voteValue = _input[2];
-        
-        // Check that the nullifier hasn't been used before
+        uint256 nullifier = input[2];
+        uint256 voteValue = input[3];
+
+        // Cheap checks first, proof verification (~200k gas) last.
+        require(input[0] == merkleRoot, "Unknown voter set");
+        require(input[1] == pollId, "Wrong poll");
         require(!nullifiers[nullifier], "Vote already cast");
-        
-        // Verify the zero-knowledge proof
-        require(verifier.verifyProof(_a, _b, _c, _input), "Invalid proof");
-        
-        // Check vote value is valid (0 or 1)
-        require(voteValue == 0 || voteValue == 1, "Invalid vote value");
-        
-        // Mark the nullifier as used
+        require(voteValue <= 1, "Invalid vote value");
+        require(verifier.verifyProof(a, b, c, input), "Invalid proof");
+
         nullifiers[nullifier] = true;
-        
-        // Count the vote
+
         if (voteValue == 1) {
             yesVotes++;
         } else {
             noVotes++;
         }
-        
-        // Emit event with vote information
-        emit VoteSubmitted(nullifier, voteValue, merkleRoot);
+
+        emit VoteSubmitted(nullifier, voteValue);
     }
-    
-    // Get current voting results
-    function getResults() external view returns (uint256, uint256) {
+
+    /// @return yes number of yes ballots
+    /// @return no  number of no ballots
+    function getResults() external view returns (uint256 yes, uint256 no) {
         return (yesVotes, noVotes);
     }
 }

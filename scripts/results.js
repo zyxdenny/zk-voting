@@ -1,8 +1,8 @@
-// Hardhat script: `npm run vote` (or `VOTE=yes npm run vote`).
+// Hardhat script: `npm run results`.
 const hre = require("hardhat");
-const { castVote } = require("./cli");
+const { showResults } = require("./cli");
 
-castVote(hre)
+showResults(hre)
     .then(() => process.exit(0))
     .catch((error) => {
         console.error(error.message || error);

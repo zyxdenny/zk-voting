@@ -1,62 +1,87 @@
+// Hashing primitives and the Poseidon Merkle tree of identity commitments.
+// Everything here must agree with circuits/circuit.circom.
 const circomlibjs = require("circomlibjs");
-const appRoot = require('app-root-path');
-const fs = require('fs');
-const { voters } = require(`${appRoot}/votersList.json`);
+
+// Must match `Vote(10)` in the circuit.
+const DEPTH = 10;
+const WIDTH = 2 ** DEPTH;
+
+// Order of the BN254 scalar field; all circuit signals live in it.
+const SNARK_SCALAR_FIELD = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+
+// Value of an empty leaf. No secret has Poseidon(secret) == 0, so padding
+// leaves can never be voted with.
+const ZERO_LEAF = "0";
+
+let poseidonPromise;
+function getPoseidon() {
+    if (!poseidonPromise) poseidonPromise = circomlibjs.buildPoseidonOpt();
+    return poseidonPromise;
+}
+
+/** Normalises a number, BigInt, decimal string or 0x string to a decimal string. */
+function toDecimal(value) {
+    return BigInt(value).toString();
+}
 
 /**
- * Creates a Merkle tree from the given voters list
- * @returns {Object} The Merkle tree object
+ * Identity commitment: the leaf registered for a voter.
+ * Matches `Poseidon(1)(secret)` in the circuit.
  */
-async function buildMerkleTree() {
-    const poseidon = await circomlibjs.buildPoseidonOpt();
+async function computeCommitment(secret) {
+    const poseidon = await getPoseidon();
+    return poseidon.F.toString(poseidon([toDecimal(secret)]));
+}
 
-    // Hash functions
-    const leafHash = (input) => poseidon([input]);
-    const nodeHash = (left, right) => poseidon([left, right]);
+/**
+ * Nullifier for one identity in one poll.
+ * Matches `Poseidon(2)(pollId, secret)` in the circuit.
+ */
+async function computeNullifier(pollId, secret) {
+    const poseidon = await getPoseidon();
+    return poseidon.F.toString(poseidon([toDecimal(pollId), toDecimal(secret)]));
+}
 
-    // Create inputs array
-    let inputs = new Array(2**10);
-    for (let i = 0; i < inputs.length; i++) {
-        if(i < voters.length) {
-            inputs[i] = voters[i];
-        } else {
-            inputs[i] = voters[voters.length - 1];
-        }
+/**
+ * Builds the Merkle tree over the registered commitments, padded with
+ * ZERO_LEAF up to WIDTH leaves.
+ * @param {Array<String>} commitments decimal strings, in registration order
+ * @returns {{tree: Object, root: String, poseidon: Object}} root is a decimal string
+ */
+async function buildMerkleTree(commitments) {
+    if (!Array.isArray(commitments) || commitments.length === 0) {
+        throw new Error("The registry has no commitments; register at least one identity first");
+    }
+    if (commitments.length > WIDTH) {
+        throw new Error(`The registry has ${commitments.length} commitments; the circuit supports at most ${WIDTH}`);
     }
 
-    // Build the tree
-    const tree = await merkleTree(inputs, leafHash, nodeHash);
-    console.log("-------------- Merkle Tree ------------------");
-    console.log("Root: ", poseidon.F.toString(tree.root));
+    const poseidon = await getPoseidon();
+    const leaves = new Array(WIDTH);
+    for (let i = 0; i < WIDTH; i++) {
+        leaves[i] = i < commitments.length ? toDecimal(commitments[i]) : ZERO_LEAF;
+    }
 
-    return { tree, poseidon };
+    // Leaves are already commitments, so the leaf "hash" is the identity map.
+    const tree = await merkleTree(leaves, (x) => poseidon.F.e(x), (l, r) => poseidon([l, r]));
+    return { tree, root: poseidon.F.toString(tree.root), poseidon };
 }
 
 /**
- * Builds a Merkle tree and returns key information
- * @returns {Object} Contains tree, root, and poseidon
+ * Authentication path of one leaf, in the shape the circuit wants.
+ * @returns {{siblings: Array<String>, path: Array<Number>}}
  */
-async function initiatePoll() {
-    const { tree, poseidon } = await buildMerkleTree();
-    const root = poseidon.F.toString(tree.root);
-    return { tree, root, poseidon };
-}
-
-/**
- * Generate a nullifier for a voter
- * @param {String} root The Merkle root
- * @param {String} addr The voter address
- * @returns {String} The nullifier
- */
-async function generateNullifier(root, addr) {
-    const poseidon = await circomlibjs.buildPoseidonOpt();
-    const addrHash = poseidon([addr]);
-    return poseidon.F.toString(poseidon([root, addrHash]));
+function merkleProofOf(tree, poseidon, index) {
+    const proof = tree.getMerkleProof(index);
+    return {
+        siblings: proof.lemma.slice(1, DEPTH + 1).map((x) => poseidon.F.toString(x)),
+        path: Array.from(proof.circompath, Number),
+    };
 }
 
 /**
  * Creates a Merkle tree object from the given input
- * @param {Array<any>} input Leafs of the merkle Tree
+ * @param {Array<any>} input Leafs of the merkle Tree (length must be a power of two)
  * @param {Function} leafHash Takes one input (leaf) and hashes it
  * @param {Function} nodeHash Takes two inputs (left and right node) and hashes it
  * @returns {Object} A Merkle tree with functionalities
@@ -73,6 +98,8 @@ async function merkleTree(input, leafHash, nodeHash) {
     merkle.inputs = [...input]; // Deep copy of array
     merkle.depth = Math.log2(merkle.inputs.length);
     merkle.nodes = [];
+
+    if (!Number.isInteger(merkle.depth)) throw new Error("Merkle tree width must be a power of two");
 
     // Calculate all nodes of the Merkle tree
     merkle.calculateNodes = function() {
@@ -101,7 +128,7 @@ async function merkleTree(input, leafHash, nodeHash) {
 
     // Creates a Merkle proof from tree
     merkle.getMerkleProof = function(index) {
-        if (merkle.inputs.length <= index) throw "Invalid index";
+        if (merkle.inputs.length <= index) throw new Error("Invalid index");
 
         // Generate path
         let path = new Uint8Array(merkle.depth).fill(0);
@@ -154,7 +181,15 @@ async function merkleTree(input, leafHash, nodeHash) {
 }
 
 module.exports = {
-    initiatePoll,
-    generateNullifier,
-    merkleTree
+    DEPTH,
+    WIDTH,
+    SNARK_SCALAR_FIELD,
+    ZERO_LEAF,
+    getPoseidon,
+    toDecimal,
+    computeCommitment,
+    computeNullifier,
+    buildMerkleTree,
+    merkleProofOf,
+    merkleTree,
 };

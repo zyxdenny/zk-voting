@@ -2,9 +2,17 @@ circuits/build/
 node_modules/
 artifacts/
 cache/
+typechain-types/
 
+# voter secrets: never commit these
+identity.json
+identities/
+
+# generated per run
+deployment.json
+contracts/Verifier.sol
+ticket.json
 voter.json
 proof.json
-ticket.json
 result.json
-contracts/Verifier.sol
+.DS_Store
