@@ -4,10 +4,15 @@ artifacts/
 cache/
 typechain-types/
 
-voter.json
-proof.json
-ticket.json
-result.json
+# voter secrets: never commit these
+identity.json
+identities/
+
+# generated per run
 deployment.json
 contracts/Verifier.sol
+ticket.json
+voter.json
+proof.json
+result.json
 .DS_Store

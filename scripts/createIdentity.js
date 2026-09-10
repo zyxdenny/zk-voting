@@ -1,7 +1,7 @@
-// `npm run get-ticket` (or `VOTER=0x... npm run get-ticket`).
-const { downloadTicket } = require("./cli");
+// `npm run identity`
+const { createIdentity } = require("./cli");
 
-downloadTicket()
+createIdentity()
     .then(() => process.exit(0))
     .catch((error) => {
         console.error(error.message || error);

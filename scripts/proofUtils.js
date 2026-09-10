@@ -2,7 +2,13 @@ const { groth16 } = require("snarkjs");
 const appRoot = require("app-root-path");
 const fs = require("fs");
 const path = require("path");
-const { buildMerkleTree, generateNullifier, voterIndex } = require("./merkleUtils");
+const {
+    toDecimal,
+    computeCommitment,
+    computeNullifier,
+    buildMerkleTree,
+    merkleProofOf,
+} = require("./merkleUtils");
 
 const BUILD_DIR = path.join(appRoot.path, "circuits", "build");
 const WASM_PATH = path.join(BUILD_DIR, "circuit_js", "circuit.wasm");
@@ -10,14 +16,14 @@ const ZKEY_PATH = path.join(BUILD_DIR, "keys", "circuit_0000.zkey");
 const VKEY_PATH = path.join(BUILD_DIR, "keys", "verification_key.json");
 const VERIFIER_SOL_PATH = path.join(appRoot.path, "contracts", "Verifier.sol");
 
-/** True once `npm run start-poll` has produced the wasm, zkey and vkey. */
+/** True once `npm run build-circuit` has produced the wasm, zkey and vkey. */
 function circuitIsBuilt() {
     return [WASM_PATH, ZKEY_PATH, VKEY_PATH].every((p) => fs.existsSync(p));
 }
 
 function ensureBuilt() {
     if (!circuitIsBuilt()) {
-        throw new Error("Circuit artifacts missing. Run `npm run start-poll` first.");
+        throw new Error("Circuit artifacts missing. Run `npm run build-circuit` first.");
     }
 }
 
@@ -35,31 +41,38 @@ function parseVote(value) {
 
 /**
  * Assembles every circuit input for one ballot.
- * @param {String} addr Registered voter address
- * @param {Number} vote 0 or 1
- * @returns {Object} {root, nullifier, vote, lemma, path} with field elements as decimal strings
+ * @param {Object} ballot
+ * @param {{secret: String}} ballot.identity   the voter's identity
+ * @param {Array<String>} ballot.commitments   the registry the poll was deployed with
+ * @param {String|BigInt} ballot.pollId        the poll's id, read from the contract
+ * @param {Number} ballot.vote                 0 or 1
+ * @returns {Object} {root, pollId, nullifier, vote, secret, siblings, path}, field elements as decimal strings
  */
-async function buildBallotInputs(addr, vote) {
-    const index = voterIndex(addr);
-    if (index < 0) throw new Error(`Address ${addr} is not a registered voter`);
+async function buildBallotInputs({ identity, commitments, pollId, vote }) {
+    const secret = toDecimal(identity.secret);
+    const commitment = await computeCommitment(secret);
+    const index = commitments.map(toDecimal).indexOf(commitment);
+    if (index < 0) {
+        throw new Error("This identity is not registered: its commitment is not in the registry");
+    }
 
-    const { tree, root, poseidon } = await buildMerkleTree();
-    const merkleProof = tree.getMerkleProof(index);
-    const nullifier = await generateNullifier(root, addr);
+    const { tree, root, poseidon } = await buildMerkleTree(commitments);
+    const { siblings, path: pathBits } = merkleProofOf(tree, poseidon, index);
 
     return {
         root,
-        nullifier,
+        pollId: toDecimal(pollId),
+        nullifier: await computeNullifier(pollId, secret),
         vote: String(vote),
-        lemma: merkleProof.lemma.map((x) => poseidon.F.toString(x)),
-        path: Array.from(merkleProof.circompath, Number),
+        secret,
+        siblings,
+        path: pathBits,
     };
 }
 
 /**
  * Runs the prover on already-assembled inputs. Throws if the inputs violate a
  * circuit constraint (the witness calculator reports "Assert Failed").
- * @param {Object} inputs see buildBallotInputs
  * @returns {{proof: Object, publicSignals: Array<String>}}
  */
 async function proveInputs(inputs) {
@@ -68,17 +81,16 @@ async function proveInputs(inputs) {
 }
 
 /**
- * Generates a ballot proof for a registered voter.
- * @param {String} addr Voter address
- * @param {Number} vote 0 or 1
+ * Generates a ballot proof.
+ * @param {Object} ballot see buildBallotInputs
  * @param {Object} [overrides] Replace individual circuit inputs (used by tests
  *                             to show that tampered inputs are rejected)
  * @returns {{proof: Object, publicSignals: Array<String>, inputs: Object}}
- *          publicSignals are [root, nullifier, vote]
+ *          publicSignals are [root, pollId, nullifier, vote]
  */
-async function generateProof(addr, vote, overrides = {}) {
+async function generateProof(ballot, overrides = {}) {
     ensureBuilt();
-    const inputs = { ...(await buildBallotInputs(addr, vote)), ...overrides };
+    const inputs = { ...(await buildBallotInputs(ballot)), ...overrides };
     const { proof, publicSignals } = await proveInputs(inputs);
     return { proof, publicSignals, inputs };
 }
@@ -103,21 +115,6 @@ async function toSolidityCalldata(proof, publicSignals) {
     return { a, b, c, input };
 }
 
-/**
- * Saves data to <repo root>/<filename>.json
- */
-function saveToFile(data, filename) {
-    const target = path.join(appRoot.path, `${filename}.json`);
-    fs.writeFileSync(target, JSON.stringify(data, null, 2), "utf8");
-    return target;
-}
-
-function loadJson(filename) {
-    const target = path.join(appRoot.path, `${filename}.json`);
-    if (!fs.existsSync(target)) return null;
-    return JSON.parse(fs.readFileSync(target, "utf8"));
-}
-
 module.exports = {
     BUILD_DIR,
     VERIFIER_SOL_PATH,
@@ -128,6 +125,4 @@ module.exports = {
     generateProof,
     verifyProof,
     toSolidityCalldata,
-    saveToFile,
-    loadJson,
 };

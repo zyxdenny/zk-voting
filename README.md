@@ -1,39 +1,41 @@
 # Anonymous Voting System with zk-SNARKs
 
 A yes/no poll where each registered voter can cast exactly one ballot, on
-chain, proving eligibility with a Groth16 zk-SNARK (circom + snarkjs) instead
-of signing with their address. The ballot is verified and tallied by a Solidity
-contract.
-
-The circuit, the prover, the verifier and the contract are wired together and
-tested end to end. The identity model is not finished: voters are identified by
-a public address list with no secret, so the scheme does not yet hide who voted
-or stop impersonation. See "What the proof guarantees" below for what is left.
+chain, without revealing which voter they are. Eligibility is proven with a
+Groth16 zk-SNARK (circom + snarkjs); the ballot is verified and tallied by a
+Solidity contract.
 
 ## How it works
 
-1. **Registration.** The organiser lists the eligible addresses in
-   `votersList.json`. They become the leaves of a Poseidon Merkle tree of depth
-   10 (up to 1024 voters); its root identifies the poll.
-2. **Deployment.** `DAOVoting` is deployed with the verifier contract and that
-   root. One contract is one poll. The contract never reads `msg.sender`, so
-   ballots can be sent by a relayer or a throwaway account.
-3. **Ticket.** A voter looks up their leaf and derives their nullifier
-   `Poseidon(root, Poseidon(address))`. The ticket is private material for this
-   poll.
-4. **Ballot.** The voter proves, in zero knowledge, that their leaf is in the
-   tree with the public root, that the nullifier is derived from that leaf,
-   and that the vote is 0 or 1. The proof's public signals are
-   `[root, nullifier, vote]`.
+1. **Identity.** Each voter generates a random secret and keeps it. Its
+   commitment `Poseidon(secret)` is the only thing they share.
+2. **Registration.** The organiser collects the commitments in
+   `registry.json`. They become the leaves of a Poseidon Merkle tree of depth
+   10 (up to 1024 voters). The list is public, and reveals nothing: a
+   commitment cannot be turned back into a secret.
+3. **Deployment.** `DAOVoting` is deployed with the verifier contract and the
+   tree's root. One contract is one poll. On construction it derives its
+   `pollId = keccak256(chainid, address) mod r`. The contract never reads
+   `msg.sender`, so ballots can be sent by a relayer or a throwaway account.
+4. **Ballot.** The voter proves, in zero knowledge, that they know a secret
+   whose commitment is in the tree with the public root, that the nullifier
+   is `Poseidon(pollId, secret)`, and that the vote is 0 or 1. The proof's
+   public signals are `[root, pollId, nullifier, vote]`.
 5. **Verification.** `DAOVoting.submitVote` checks that the root is this poll's
-   root, that the nullifier is unspent, that the vote is binary, and that the
-   proof verifies. Then it marks the nullifier spent and counts the vote.
+   root, that the poll id is its own, that the nullifier is unspent, that the
+   vote is binary, and that the proof verifies. Then it marks the nullifier
+   spent and counts the vote.
 
-The nullifier is what makes one-ballot-per-voter work: it is the same every
-time the same voter proves for the same poll, so a second ballot is detected
-without the contract learning which leaf it came from. Whether it can be linked
-back to a voter depends on the leaf containing something only the voter knows,
-which the current design does not do yet (see below).
+Two derivations carry the whole design:
+
+- `commitment = Poseidon(secret)` is what makes the ballot anonymous and
+  unforgeable at once. Anyone can see the registry, but only the holder of a
+  secret can prove membership, and the proof does not say which leaf it is for.
+- `nullifier = Poseidon(pollId, secret)` is what makes it one ballot per voter.
+  The same secret in the same poll always yields the same nullifier, so a
+  second ballot is detected. The same secret in a different poll yields an
+  unrelated nullifier, so ballots cannot be linked across polls, and a ballot
+  cannot be replayed on another deployment or another chain.
 
 ## Quick start
 
@@ -47,87 +49,97 @@ which the current design does not do yet (see below).
 
 ```bash
 npm i
-npm run start-poll     # compile circuit, Groth16 setup, export vkey + Verifier.sol, print the voter set
+npm run build-circuit  # compile circuit, Groth16 setup, export vkey + Verifier.sol
+
+npm run identity       # voter:     writes identity.json (keep it private), prints the commitment
+npm run register       # organiser: adds that commitment to registry.json
 
 npm run node           # terminal 1: local Hardhat chain
-npm run deploy         # terminal 2: deploy Groth16Verifier + DAOVoting, writes deployment.json
+npm run deploy         # terminal 2: deploy Groth16Verifier + DAOVoting bound to registry.json
 
-npm run get-ticket     # prompts for your address (must be in votersList.json), writes ticket.json
-npm run vote           # prompts yes/no, proves eligibility, submits the ballot on chain
+npm run vote           # voter: prompts yes/no, proves eligibility, submits the ballot on chain
 npm run results        # read the tally
 ```
 
-Every prompt can be answered from the environment, which is handy for scripts:
+The root is fixed when the poll is deployed, so register everyone before
+`npm run deploy`. A second `npm run vote` with the same identity is rejected
+by the contract with `Vote already cast`.
+
+Every prompt can be answered from the environment, which is handy for scripts
+and for playing several voters on one machine:
 
 ```bash
-VOTER=0x1f9090aaE28b8a3dCeaDf281B0F12828e676c326 npm run get-ticket
-VOTE=yes npm run vote
+IDENTITY=alice.json npm run identity     # identity file (default identity.json)
+IDENTITY=alice.json npm run register     # or: COMMITMENT=123... npm run register
+IDENTITY=alice.json VOTE=yes npm run vote
 ```
-
-To simulate several voters, repeat `get-ticket` and `vote` with different
-addresses. A second `vote` for the same address is rejected by the contract
-with `Vote already cast`.
 
 Other commands:
 
 ```bash
-npm run verify         # prove + verify one ballot off chain, no node needed
+npm run registry       # list registered commitments and the root a deployment would use
+npm run verify         # prove + verify one ballot off chain (POLL_ID=..., default 1), no node needed
 npm test               # unit tests (mock verifier) + end-to-end tests (real proofs, skipped if the circuit is not built)
-npm run clean          # remove build output, keys, ticket and deployment
+npm run clean          # remove build output, keys and the deployment; identities are never deleted
 ```
 
 ## Project structure
 
 ```
-├── circuits/circuit.circom   # Vote(10): Merkle membership + nullifier + binary vote
+├── circuits/circuit.circom   # Vote(10): commitment, Merkle membership, nullifier, binary vote
 ├── contracts/
-│   ├── DAOVoting.sol         # the poll: root check, nullifier set, tally
-│   ├── MockVerifier.sol      # always-true verifier for unit tests only
-│   └── Verifier.sol          # generated by `npm run start-poll` (gitignored)
+│   ├── DAOVoting.sol         # the poll: root and pollId checks, nullifier set, tally
+│   ├── MockVerifier.sol      # configurable verifier for unit tests only
+│   └── Verifier.sol          # generated by `npm run build-circuit` (gitignored)
 ├── scripts/
-│   ├── merkleUtils.js        # Poseidon Merkle tree, nullifier
+│   ├── merkleUtils.js        # Poseidon Merkle tree, commitment and nullifier derivations
+│   ├── identity.js           # generate / load the voter's secret
+│   ├── registry.js           # the organiser's list of commitments
 │   ├── proofUtils.js         # circuit inputs, Groth16 prove/verify, Solidity calldata
 │   ├── votingSystem.js       # submit a ballot to the deployed contract, read results
-│   ├── cli.js                # prompts for get-ticket / vote / results
+│   ├── cli.js                # prompts for identity / register / vote / results
 │   ├── deploy.js             # deploy verifier + poll, write deployment.json
-│   └── vote.js, results.js, getTicket.js, genVoterData.js, main.js   # npm script entry points
+│   └── createIdentity.js, register.js, showRegistry.js, vote.js, results.js, main.js   # npm script entry points
 ├── test/
 │   ├── DAOVoting.test.js     # contract checks with the mock verifier
 │   └── e2e.test.js           # real proofs against the real verifier
-├── votersList.json           # the eligible addresses
+├── registry.json             # the registered commitments (public)
 └── powersOfTau28_hez_final_14.ptau   # phase-1 parameters for the Groth16 setup
 ```
 
 ## What the proof guarantees, and what it does not
 
-The circuit binds three things together: the public root (so the contract can
-pin the voter set), the nullifier (so each leaf votes once), and the vote (so
-whoever relays the transaction cannot change it). A proof made against any
-other tree, or with a nullifier that does not belong to the leaf, or with a
-vote outside {0, 1}, cannot be produced; the tests in `test/e2e.test.js` show
-each rejection.
+The circuit binds four things together: the public root (so the contract can
+pin the voter set), the poll id (so nullifiers are per poll), the nullifier
+(so each secret votes once per poll), and the vote (so whoever relays the
+transaction cannot change it). The tests in `test/e2e.test.js` show each
+rejection: a forged registry, a registered commitment with the wrong secret, a
+flipped vote, a stolen nullifier, a replay into another poll, a non-binary
+vote.
 
 Known limitations of the current design:
 
-- **Eligibility is a public list of addresses, and there is no secret.** The
-  leaf is `Poseidon(address)`, which anyone can compute from `votersList.json`.
-  Two consequences: anyone can produce a valid ballot for any registered
-  address, and anyone can compute every voter's nullifier and so tell which
-  address each on-chain ballot belongs to. Until this is fixed the system is
-  neither anonymous nor impersonation-proof against someone holding the list.
-  The fix is the Semaphore pattern: each voter generates a secret and registers
-  the commitment `Poseidon(secret)` as their leaf, and the circuit derives the
-  nullifier from the secret. That is a change to the circuit's private inputs,
-  to `get-ticket`, and to how the list is assembled, not to the contract.
 - **The trusted setup has no ceremony.** `npm run setup` runs
-  `snarkjs groth16 setup` once; whoever runs it holds the toxic waste. Real use
-  needs a multi-party phase-2 contribution.
+  `snarkjs groth16 setup` once; whoever runs it holds the toxic waste and could
+  forge proofs. Real use needs a multi-party phase-2 contribution, or a
+  universal-setup system such as PLONK or fflonk.
 - **Anonymity depends on how the ballot is sent.** The contract ignores
-  `msg.sender`, but if voters submit from their own registered addresses the
-  chain links them anyway. Use a relayer or fresh accounts.
-- **Padding.** Empty leaves repeat the last registered voter. In this scheme
-  every leaf is votable, so padding with any other value would create ballots;
-  duplicates of a real voter share that voter's nullifier and add nothing.
+  `msg.sender`, but somebody pays the gas. If voters submit from accounts that
+  are linked to them, the chain links the ballot too. Use a relayer or fresh
+  accounts.
+- **The tally is visible while voting is open.** Anyone can read the counts at
+  any time, which invites bandwagon effects. Commit-reveal or an encrypted
+  tally would hide interim results.
+- **The registry is curated by the organiser and frozen at deployment.**
+  Voters cannot verify that the list is fair, and nobody can be added after
+  `npm run deploy`. An on-chain incremental Merkle tree with self-registration
+  would fix both.
+- **One contract is one poll.** `pollId` is derived from the contract address;
+  to run several proposals in one contract, derive it from
+  `(chainid, address, proposalId)` instead and keep a nullifier set per
+  proposal.
+- **The secret is a plaintext file.** `identity.json` is only as safe as the
+  machine it sits on.
 
 ## License
 

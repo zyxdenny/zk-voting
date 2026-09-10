@@ -1,14 +1,18 @@
 // `npm run verify`: proves and verifies one ballot off-chain, without a node.
-// Useful to check the circuit build. Nothing is submitted anywhere.
-const { voters } = require("./merkleUtils");
+// Uses the local identity, registry.json and POLL_ID (default 1). Nothing is
+// submitted anywhere; this only checks the circuit build.
+const { loadIdentity } = require("./identity");
+const { loadRegistry } = require("./registry");
 const { generateProof, verifyProof, parseVote } = require("./proofUtils");
 
 async function main() {
-    const address = process.env.VOTER || voters[0];
+    const identity = await loadIdentity();
+    const { commitments } = loadRegistry();
+    const pollId = process.env.POLL_ID || "1";
     const vote = parseVote(process.env.VOTE || "yes");
 
-    const { proof, publicSignals } = await generateProof(address, vote);
-    console.log("-------------- Public Signals [root, nullifier, vote] ------------------");
+    const { proof, publicSignals } = await generateProof({ identity, commitments, pollId, vote });
+    console.log("-------------- Public Signals [root, pollId, nullifier, vote] ------------------");
     console.log(publicSignals);
     console.log("---------------- Proof ----------------");
     console.log(JSON.stringify(proof, null, 2));

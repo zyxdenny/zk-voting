@@ -1,7 +1,7 @@
-// `npm run init-voters`: last step of `npm run start-poll`.
-const { startPoll } = require("./cli");
+// `npm run registry`
+const { showRegistry } = require("./cli");
 
-startPoll()
+showRegistry()
     .then(() => process.exit(0))
     .catch((error) => {
         console.error(error.message || error);

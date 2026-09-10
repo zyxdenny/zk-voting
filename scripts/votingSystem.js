@@ -4,6 +4,7 @@ const appRoot = require("app-root-path");
 const fs = require("fs");
 const path = require("path");
 const { generateProof, verifyProof, toSolidityCalldata } = require("./proofUtils");
+const { loadRegistry } = require("./registry");
 
 const DEPLOYMENT_PATH = path.join(appRoot.path, "deployment.json");
 
@@ -47,26 +48,34 @@ async function readResults(poll) {
 /**
  * Casts one ballot on-chain.
  * @param {Object} hre Hardhat runtime environment
- * @param {{address: String, vote: Number}} ballot voter address and 0/1
- * @param {{poll?: Object, signer?: Object}} [options]
+ * @param {{identity: {secret: String}, vote: Number}} ballot the voter's identity and 0/1
+ * @param {{poll?: Object, signer?: Object, commitments?: Array<String>}} [options]
+ *        poll defaults to deployment.json, commitments to registry.json
  * @returns {{receipt: Object, nullifier: String, results: {yes: Number, no: Number}}}
  */
-async function castBallot(hre, { address, vote }, options = {}) {
+async function castBallot(hre, { identity, vote }, options = {}) {
     let poll = options.poll || (await getPoll(hre));
     if (options.signer) poll = poll.connect(options.signer);
+    const commitments = options.commitments || loadRegistry().commitments;
 
-    const { proof, publicSignals } = await generateProof(address, vote);
+    const [onchainRoot, pollId] = await Promise.all([poll.merkleRoot(), poll.pollId()]);
+
+    const { proof, publicSignals } = await generateProof({
+        identity,
+        commitments,
+        pollId: pollId.toString(),
+        vote,
+    });
+
+    if (publicSignals[0] !== onchainRoot.toString()) {
+        throw new Error(
+            "registry.json does not match the voter set this poll was deployed with. " +
+            "Either restore the registry or redeploy."
+        );
+    }
 
     if (!(await verifyProof(proof, publicSignals))) {
         throw new Error("Generated proof failed local verification; the circuit build and the verification key disagree");
-    }
-
-    const onchainRoot = (await poll.merkleRoot()).toString();
-    if (onchainRoot !== publicSignals[0]) {
-        throw new Error(
-            "The local votersList.json does not match the voter set this poll was deployed with. " +
-            "Either restore the list or redeploy."
-        );
     }
 
     const { a, b, c, input } = await toSolidityCalldata(proof, publicSignals);
@@ -78,7 +87,7 @@ async function castBallot(hre, { address, vote }, options = {}) {
         throw new Error(`Ballot rejected by the contract: ${revertReason(err)}`);
     }
 
-    return { receipt, nullifier: publicSignals[1], results: await readResults(poll) };
+    return { receipt, nullifier: publicSignals[2], results: await readResults(poll) };
 }
 
 /** Pulls the require() reason string out of an ethers/Hardhat error. */

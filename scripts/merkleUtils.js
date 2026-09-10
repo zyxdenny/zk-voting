@@ -1,10 +1,17 @@
+// Hashing primitives and the Poseidon Merkle tree of identity commitments.
+// Everything here must agree with circuits/circuit.circom.
 const circomlibjs = require("circomlibjs");
-const appRoot = require("app-root-path");
-const { voters } = require(`${appRoot}/votersList.json`);
 
-// Must match `Vote(10)` in circuits/circuit.circom.
+// Must match `Vote(10)` in the circuit.
 const DEPTH = 10;
 const WIDTH = 2 ** DEPTH;
+
+// Order of the BN254 scalar field; all circuit signals live in it.
+const SNARK_SCALAR_FIELD = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+
+// Value of an empty leaf. No secret has Poseidon(secret) == 0, so padding
+// leaves can never be voted with.
+const ZERO_LEAF = "0";
 
 let poseidonPromise;
 function getPoseidon() {
@@ -12,61 +19,64 @@ function getPoseidon() {
     return poseidonPromise;
 }
 
-/**
- * Position of an address in votersList.json, or -1 if it is not registered.
- * Case-insensitive: the leaf is Poseidon(address-as-field-element), which
- * does not depend on the hex casing.
- */
-function voterIndex(addr) {
-    if (typeof addr !== "string") return -1;
-    const needle = addr.trim().toLowerCase();
-    return voters.findIndex((v) => v.toLowerCase() === needle);
+/** Normalises a number, BigInt, decimal string or 0x string to a decimal string. */
+function toDecimal(value) {
+    return BigInt(value).toString();
 }
 
 /**
- * Builds the Poseidon Merkle tree of registered voters.
+ * Identity commitment: the leaf registered for a voter.
+ * Matches `Poseidon(1)(secret)` in the circuit.
+ */
+async function computeCommitment(secret) {
+    const poseidon = await getPoseidon();
+    return poseidon.F.toString(poseidon([toDecimal(secret)]));
+}
+
+/**
+ * Nullifier for one identity in one poll.
+ * Matches `Poseidon(2)(pollId, secret)` in the circuit.
+ */
+async function computeNullifier(pollId, secret) {
+    const poseidon = await getPoseidon();
+    return poseidon.F.toString(poseidon([toDecimal(pollId), toDecimal(secret)]));
+}
+
+/**
+ * Builds the Merkle tree over the registered commitments, padded with
+ * ZERO_LEAF up to WIDTH leaves.
+ * @param {Array<String>} commitments decimal strings, in registration order
  * @returns {{tree: Object, root: String, poseidon: Object}} root is a decimal string
  */
-async function buildMerkleTree() {
-    if (voters.length === 0) throw new Error("votersList.json has no voters");
-    if (voters.length > WIDTH) {
-        throw new Error(`votersList.json has ${voters.length} voters; the circuit supports at most ${WIDTH}`);
+async function buildMerkleTree(commitments) {
+    if (!Array.isArray(commitments) || commitments.length === 0) {
+        throw new Error("The registry has no commitments; register at least one identity first");
+    }
+    if (commitments.length > WIDTH) {
+        throw new Error(`The registry has ${commitments.length} commitments; the circuit supports at most ${WIDTH}`);
     }
 
     const poseidon = await getPoseidon();
-    const leafHash = (input) => poseidon([input]);
-    const nodeHash = (left, right) => poseidon([left, right]);
-
-    // Pad the tree by repeating the last voter. In this scheme every leaf in
-    // the tree is votable, so padding with any *other* value (0, a random
-    // number) would create extra ballots. Duplicates of a real voter share
-    // that voter's nullifier and therefore add nothing.
-    const inputs = new Array(WIDTH);
+    const leaves = new Array(WIDTH);
     for (let i = 0; i < WIDTH; i++) {
-        inputs[i] = i < voters.length ? voters[i] : voters[voters.length - 1];
+        leaves[i] = i < commitments.length ? toDecimal(commitments[i]) : ZERO_LEAF;
     }
 
-    const tree = await merkleTree(inputs, leafHash, nodeHash);
-    const root = poseidon.F.toString(tree.root);
-    return { tree, root, poseidon };
-}
-
-/** @deprecated kept for older callers; identical to buildMerkleTree */
-async function initiatePoll() {
-    return buildMerkleTree();
+    // Leaves are already commitments, so the leaf "hash" is the identity map.
+    const tree = await merkleTree(leaves, (x) => poseidon.F.e(x), (l, r) => poseidon([l, r]));
+    return { tree, root: poseidon.F.toString(tree.root), poseidon };
 }
 
 /**
- * Nullifier for one voter in one poll: Poseidon(root, Poseidon(addr)).
- * Matches `poseidon(root, lemma[0]) === nullifier` in the circuit.
- * @param {String} root Merkle root (decimal string)
- * @param {String} addr Voter address
- * @returns {String} decimal string
+ * Authentication path of one leaf, in the shape the circuit wants.
+ * @returns {{siblings: Array<String>, path: Array<Number>}}
  */
-async function generateNullifier(root, addr) {
-    const poseidon = await getPoseidon();
-    const leaf = poseidon([addr]);
-    return poseidon.F.toString(poseidon([root, leaf]));
+function merkleProofOf(tree, poseidon, index) {
+    const proof = tree.getMerkleProof(index);
+    return {
+        siblings: proof.lemma.slice(1, DEPTH + 1).map((x) => poseidon.F.toString(x)),
+        path: Array.from(proof.circompath, Number),
+    };
 }
 
 /**
@@ -172,11 +182,14 @@ async function merkleTree(input, leafHash, nodeHash) {
 
 module.exports = {
     DEPTH,
-    voters,
-    voterIndex,
+    WIDTH,
+    SNARK_SCALAR_FIELD,
+    ZERO_LEAF,
     getPoseidon,
+    toDecimal,
+    computeCommitment,
+    computeNullifier,
     buildMerkleTree,
-    initiatePoll,
-    generateNullifier,
-    merkleTree
+    merkleProofOf,
+    merkleTree,
 };
